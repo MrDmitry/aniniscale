@@ -1,5 +1,5 @@
 /*
-* Copyright (C) 2017 by Dmitry Odintsov
+* Copyright (c) 2017 Dmitry Odintsov
 * This code is licensed under the MIT license (MIT)
 * (http://opensource.org/licenses/MIT)
 */
