@@ -5,4 +5,5 @@ g++ -o aniniscale -g -Wall main.cpp ^
 -L%VIPS_PATH%\lib ^
 -I%VIPS_PATH%\include ^
 -I%VIPS_PATH%\include\glib-2.0 ^
--I%VIPS_PATH%\lib\glib-2.0\include
+-I%VIPS_PATH%\lib\glib-2.0\include ^
+-Wl,-Bstatic -lpthread -Wl,-Bdynamic
