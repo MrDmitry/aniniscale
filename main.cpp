@@ -28,19 +28,13 @@ static int taskPixels = 0;
 static int totalPixels = 0;
 
 static const std::time_t startTime = std::time(0);
-static volatile std::time_t lastReport = std::time(0);
-static volatile std::time_t etaReport = std::time(0);
+static volatile std::time_t progressReport = std::time(0);
+
 
 //! Prints out elapsed time at most once per 5 seconds
 void ReportElapsedTime()
 {
-    if (std::time(0) - lastReport < 5)
-    {
-        return;
-    }
-
-    lastReport = std::time(0);
-    std::time_t elapsed = lastReport - startTime;
+    std::time_t elapsed = std::time(0) - startTime;
 
     char buffer[9];
     if (std::strftime(buffer, sizeof(buffer), "%H:%M:%S", std::gmtime(&elapsed)))
@@ -56,19 +50,15 @@ void ReportElapsedTime()
 }
 
 //! Prints out ETA at most once per 5 seconds
-void EstimateTimeLeft(unsigned int pixelsLeft)
+void EstimateTimeLeft(uint32_t tasksLeft)
 {
-    if (std::time(0) - etaReport < 5)
-    {
-        return;
-    }
+    std::time_t elapsed = std::time(0) - startTime;
 
-    etaReport = std::time(0);
-    std::time_t elapsed = etaReport - startTime;
+    uint32_t pixelsLeft = tasksLeft * taskPixels;
 
     double perSecond = ((double)(totalPixels - pixelsLeft)) / ((double)elapsed);
 
-    std::time_t eta = static_cast<unsigned int>(((double)pixelsLeft) / perSecond);
+    std::time_t eta = static_cast<uint32_t>(((double)pixelsLeft) / perSecond);
 
     char buffer[9];
     if (std::strftime(buffer, sizeof(buffer), "%H:%M:%S", std::gmtime(&eta)))
@@ -81,6 +71,23 @@ void EstimateTimeLeft(unsigned int pixelsLeft)
     {
         std::cout << "Failed to convert data ¯\\_(ツ)_/¯" << std::endl;
     }
+}
+
+void ProgressReport(uint32_t tasksLeft)
+{
+    if (std::time(0) - progressReport < 5)
+    {
+        return;
+    }
+
+    std::cout << std::endl;
+
+    ReportElapsedTime();
+    EstimateTimeLeft(tasksLeft);
+
+    progressReport = std::time(0);
+
+    std::cout << "Tasks left: " << tasksLeft << " (" << tasksLeft * taskPixels << "px)" << std::endl;
 }
 
 //! Described pool of thread workers
@@ -98,12 +105,8 @@ public:
 
         while (!m_tasks.empty())
         {
-            unsigned int pixelsLeft = m_tasks.size() * taskPixels;
-            std::cout << "Pixels left: " << pixelsLeft << std::endl;
-
             //! Before you start working - report current time status
-            ReportElapsedTime();
-            EstimateTimeLeft(pixelsLeft);
+            ProgressReport(m_tasks.size());
 
             //! Take a task
             Task task = m_tasks.front();
