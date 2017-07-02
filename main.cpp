@@ -23,13 +23,17 @@ using namespace vips;
 
 static int x_factor = 1;
 static int y_factor = 1;
+
 static int bandCount = 3;
+
 static int taskPixels = 0;
 static int totalPixels = 0;
 
+//! Each task shall be comprised of no more than 64 by 64 sections
+static int taskSectionSide = 64;
+
 static const std::time_t startTime = std::time(0);
 static volatile std::time_t progressReport = std::time(0);
-
 
 //! Prints out elapsed time at most once per 5 seconds
 void ReportElapsedTime()
@@ -138,61 +142,65 @@ private:
 };
 
 //! Task at hand - process portion of an image
-void work(VImage img, std::vector<unsigned char>& out)
+void work(VImage img, std::vector<uint8_t>& out)
 {
     //! Get image dimensions
-    const unsigned int width = img.width();
-    const unsigned int height = img.height();
+    const uint32_t width = img.width();
+    const uint32_t height = img.height();
 
     //! Calculate tile count (== pixels in the end result)
-    const unsigned int x_tiles = width / x_factor;
-    const unsigned int y_tiles = height / y_factor;
+    const uint32_t x_tiles = width / x_factor;
+    const uint32_t y_tiles = height / y_factor;
 
     //! Calculate size of each tile
-    const unsigned int size = x_factor * y_factor;
+    const uint32_t size = x_factor * y_factor;
 
     //! Calculate color threshold - if color has this much, it is dominating
-    const unsigned int win = size / 2;
+    const uint32_t win = size / 2;
+
+    //! Get pixel data
+    const uint8_t* imgPixels = reinterpret_cast<const uint8_t*>(img.data());
 
     //! Iterate over all tiles
-    for (unsigned int x = 0; x < x_tiles; ++x)
+    for (uint32_t x = 0; x < x_tiles; ++x)
     {
-        for (unsigned int y = 0; y < y_tiles; ++y)
+        for (uint32_t y = 0; y < y_tiles; ++y)
         {
-            //! Get original area [x_factor by y_factor]
-            VImage area = img.extract_area(x * x_factor, y * y_factor, x_factor, y_factor);
-
-            //! Get pixel data
-            const unsigned char* pixels = reinterpret_cast<const unsigned char*>(area.data());
-
             //! Find dominant color
             // @TODO: there must be some better way to do this. Histograms?
-            std::map<unsigned int, unsigned int> colors;
-            unsigned int dominant = 0;
-            unsigned int domCount = 0;
+            std::map<uint32_t, uint32_t> colors;
+            const uint8_t* dominant = 0;
+            uint32_t domCount = 0;
 
             //! Iterate over all pixels in original area
-            for (unsigned int i = 0; i < size; ++i)
+            for (int areaX = 0; areaX < x_factor; ++areaX)
             {
-                unsigned int color = 0;
-
-                //! Get color value
-                for (int b = 0; b < bandCount; ++b)
+                for (int areaY = 0; areaY < y_factor; ++areaY)
                 {
-                    color |= pixels[i * bandCount + b] << ((bandCount - 1 - b) * 8);
-                }
+                    const uint8_t* pixel = imgPixels + (
+                        (areaY + y * y_factor) * width + areaX + x * x_factor
+                        ) * bandCount;
 
-                //! Increase the number of votes for that color and check if it's dominating
-                colors[color] += 1;
+                    uint32_t color = 0;
 
-                if (domCount < colors[color])
-                {
-                    domCount = colors[color];
-                    dominant = color;
-
-                    if (domCount >= win)
+                    //! Get color value
+                    for (int b = 0; b < bandCount; ++b)
                     {
-                        break;
+                        color |= pixel[b] << ((bandCount - 1 - b) * 8);
+                    }
+
+                    //! Increase the number of votes for that color and check if it's dominating
+                    colors[color] += 1;
+
+                    if (domCount < colors[color])
+                    {
+                        domCount = colors[color];
+                        dominant = pixel;
+
+                        if (domCount >= win)
+                        {
+                            break;
+                        }
                     }
                 }
             }
@@ -200,13 +208,13 @@ void work(VImage img, std::vector<unsigned char>& out)
             //! Paint the resulting pixel with dominant color
             for (int b = 0; b < bandCount; ++b)
             {
-                out[(y * x_tiles + x) * bandCount + b] = (dominant >> ((bandCount - 1 - b) * 8)) & 0xFF;
+                out[(y * x_tiles + x) * bandCount + b] = *(dominant + b);
             }
         }
     }
 }
 
-int main( int argc, char **argv )
+int main(int argc, char** argv)
 {
     //! Initialize VIPS library
     if( VIPS_INIT( argv[0] ) )
@@ -219,7 +227,7 @@ int main( int argc, char **argv )
     if (argc < 5)
     {
         std::cout << "Not enough arguments" << std::endl;
-        std::cout << "Usage: aniniscale <x_factor> <y_factor> <in_image> <out_image>" << std::endl;
+        std::cout << "Usage: aniniscale <x_factor> <y_factor> <in_image> <out_image> [<task_side>]" << std::endl;
         return -1;
     }
 
@@ -231,6 +239,11 @@ int main( int argc, char **argv )
     if (x_factor < 1 || y_factor < 1)
     {
         return -1;
+    }
+
+    if (argc > 5)
+    {
+        taskSectionSide = atoi(argv[5]);
     }
 
     //! Open the image and check channel count
@@ -245,19 +258,15 @@ int main( int argc, char **argv )
     }
 
     //! Get image information and estimate how it will be divided
-    const unsigned int width = img.width();
-    const unsigned int height = img.height();
-    const unsigned int x_tiles = width / x_factor;
-    const unsigned int y_tiles = height / y_factor;
-
-    //! Arbitrary limit of task's area
-    const unsigned int max_x_sections = x_factor * x_factor;
-    const unsigned int max_y_sections = y_factor * y_factor;
+    const uint32_t width = img.width();
+    const uint32_t height = img.height();
+    const uint32_t x_tiles = width / x_factor;
+    const uint32_t y_tiles = height / y_factor;
 
     totalPixels = width * height;
 
     //! Check how many threads we can run
-    unsigned int workerCount = std::thread::hardware_concurrency();
+    uint32_t workerCount = std::thread::hardware_concurrency();
 
     //! Make sure it's a multiple of 2
     if (workerCount % 2 != 0)
@@ -278,74 +287,87 @@ int main( int argc, char **argv )
     }
 
     //! Tasks shall not be too big, so we keep them manageable
-    unsigned int x_section = x_tiles / workerCount;
-    unsigned int y_section = y_tiles / workerCount;
+    int x_section = x_tiles / workerCount;
 
-    while (x_section > max_x_sections)
+    while (x_section > taskSectionSide)
     {
         x_section /= 2;
     }
 
-    while (y_section > max_y_sections)
+    int y_section = y_tiles / workerCount;
+
+    while (y_section > taskSectionSide)
     {
         y_section /= 2;
     }
 
-    //! Calculate sizes of each section and their total count
-    const unsigned int x_sectionSize = x_section * x_factor;
-    const unsigned int y_sectionSize = y_section * y_factor;
+    const uint32_t x_sectionSize = x_section * x_factor;
+    const uint32_t y_sectionSize = y_section * y_factor;
 
-    const unsigned int x_sectionCount = width / x_sectionSize;
-    const unsigned int y_sectionCount = height / y_sectionSize;
+    const uint32_t x_sectionCount = width / x_sectionSize;
+    const uint32_t y_sectionCount = height / y_sectionSize;
 
     //! Store total number of pixels on the image for the reporting
     taskPixels = x_sectionSize * y_sectionSize;
 
     WorkerPool pool;
 
-    std::cout << "Creating tasks" << std::endl;
+    std::cout << "Creating " << x_sectionCount * y_sectionCount << " tasks of size " << x_sectionSize << "x" << y_sectionSize << std::endl;
 
-    std::map<std::pair<unsigned int, unsigned int>, std::vector<unsigned char>> result;
+    std::map<std::pair<uint32_t, uint32_t>, std::vector<uint8_t>> result;
 
     //! Allocate all needed memory
-    for (unsigned int x_task = 0; x_task < x_sectionCount; ++x_task)
+    for (uint32_t x_task = 0; x_task < x_sectionCount; ++x_task)
     {
-        for (unsigned int y_task = 0; y_task < y_sectionCount; ++y_task)
+        for (uint32_t y_task = 0; y_task < y_sectionCount; ++y_task)
         {
-            result[std::pair<unsigned int, unsigned int>(x_task, y_task)].resize(x_section * y_section * bandCount);
+            result[std::pair<uint32_t, uint32_t>(x_task, y_task)].resize(x_section * y_section * bandCount);
         }
     }
 
-    //! Create tasks to process each section
-    for (unsigned int x_task = 0; x_task < x_sectionCount; ++x_task)
-    {
-        for (unsigned int y_task = 0; y_task < y_sectionCount; ++y_task)
+    auto ReportTaskCreationProgress = [&](uint32_t count){
+        static std::time_t lastTime = std::time(0);
+        const std::time_t now = std::time(0);
+
+        if (now - lastTime > 5)
         {
-            std::pair<unsigned int, unsigned int> coords(x_task, y_task);
+            std::cout << "Progress: " << count << "/" << result.size() << std::endl;
+            lastTime = now;
+        }
+    };
+
+    //! Create tasks to process each section
+    for (uint32_t x_task = 0; x_task < x_sectionCount; ++x_task)
+    {
+        for (uint32_t y_task = 0; y_task < y_sectionCount; ++y_task)
+        {
+            std::pair<uint32_t, uint32_t> coords(x_task, y_task);
 
             VImage area = img.extract_area(coords.first * x_sectionSize,
                 coords.second * y_sectionSize,
                 x_sectionSize,
                 y_sectionSize);
 
-            pool.PushTask([=, &result](){ work(area, result[std::pair<unsigned int, unsigned int>(x_task, y_task)]); });
+            pool.PushTask([=, &result](){ work(area, result[std::pair<uint32_t, uint32_t>(x_task, y_task)]); });
+
+            ReportTaskCreationProgress(x_task * y_sectionCount + y_task);
         }
     }
 
-    std::cout << "Created " << result.size() << " tasks" << std::endl;
+    std::cout << "Task creation complete" << std::endl;
 
-    std::cout << "Total pixels to be processed: " << totalPixels << std::endl;
+    std::cout << "Total area to be processed: " << width << "x" << height << " (" << totalPixels << "px)" << std::endl;
 
     //! Spawn workers
     std::vector<std::thread> workers;
     workers.resize(workerCount);
-    for (unsigned int i = 0; i < workerCount; ++i)
+    for (uint32_t i = 0; i < workerCount; ++i)
     {
         workers[i] = std::thread(&WorkerPool::Worker, &pool);
     }
 
     //! Wait for all workers to finish
-    for (unsigned int i = 0; i < workerCount; ++i)
+    for (uint32_t i = 0; i < workerCount; ++i)
     {
         workers[i].join();
     }
@@ -353,17 +375,17 @@ int main( int argc, char **argv )
     workers.clear();
 
     //! Prepare the buffer to store final output
-    std::vector<unsigned char> outBuffer;
+    std::vector<uint8_t> outBuffer;
     outBuffer.resize(x_tiles * y_tiles * bandCount);
 
-    VImage out = VImage::VImage::new_from_memory(outBuffer.data(), outBuffer.size(),
+    VImage out = VImage::new_from_memory(outBuffer.data(), outBuffer.size(),
         x_tiles, y_tiles, bandCount, img.format());
 
     //! Go through worker results and place them in resulting image
     for (auto& r : result)
     {
-        const std::pair<unsigned int, unsigned int>& coords = r.first;
-        std::vector<unsigned char>& buffer = r.second;
+        const std::pair<uint32_t, uint32_t>& coords = r.first;
+        std::vector<uint8_t>& buffer = r.second;
         VImage block = VImage::new_from_memory(buffer.data(), buffer.size(),
             x_section, y_section, bandCount, img.format());
 
