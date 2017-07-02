@@ -1,4 +1,5 @@
-aniniscale v1.0.0
+aniniscale v1.0.1
+
 Depends on [libvips](https://github.com/jcupitt/libvips) for image processing
 
 Downscales image by reducing blocks in original image to a single pixel of dominant color.

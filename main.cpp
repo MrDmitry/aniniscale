@@ -18,7 +18,7 @@
 #include "WorkerPool.hpp"
 
 static const char* s_appName = "aniniscale";
-static const char* s_versionInfo = "1.0.0";
+static const char* s_versionInfo = "1.0.1";
 
 struct Arguments
 {
@@ -187,29 +187,22 @@ Arguments ProcessArgs(int argc, char** argv)
     return arguments;
 }
 
-int main(int argc, char** argv)
+int Process(const Arguments& arguments)
 {
-    //! Initialize VIPS library
-    if( VIPS_INIT( argv[0] ) )
+    //! Open the image and check channel count
+    vips::VImage img;
+
+    try
     {
+        img = vips::VImage::new_from_file( arguments.in.c_str() );
+    }
+    catch( vips::VError& e )
+    {
+        std::cout << "Error occured while opening image " << arguments.in.c_str() << std::endl;
+        std::cerr << e.what() << std::endl;
         return -1;
     }
 
-    std::string in;
-    std::string out;
-    bool help = false;
-
-    Arguments arguments = ProcessArgs(argc, argv);
-
-    if (!arguments.IsValid())
-    {
-        PrintUsage(arguments);
-
-        return help ? 0 : -1;
-    }
-
-    //! Open the image and check channel count
-    vips::VImage img = vips::VImage::new_from_file( arguments.in.c_str() );
     int bandCount = img.bands();
 
     //! If both blocks are 1, we can just save the image
@@ -350,27 +343,74 @@ int main(int argc, char** argv)
     vips::VImage outImg = vips::VImage::new_from_memory(outBuffer.data(), outBuffer.size(),
         x_tiles, y_tiles, bandCount, img.format());
 
-    //! Go through worker results and place them in resulting image
-    for (auto& r : result)
+    try
     {
-        const std::pair<uint32_t, uint32_t>& coords = r.first;
-        std::vector<uint8_t>& buffer = r.second;
-        vips::VImage block = vips::VImage::new_from_memory(buffer.data(), buffer.size(),
-            x_sectionsInTask, y_sectionsInTask, bandCount, img.format());
+        //! Go through worker results and place them in resulting image
+        for (auto& r : result)
+        {
+            const std::pair<uint32_t, uint32_t>& coords = r.first;
+            std::vector<uint8_t>& buffer = r.second;
+            vips::VImage block = vips::VImage::new_from_memory(buffer.data(), buffer.size(),
+                x_sectionsInTask, y_sectionsInTask, bandCount, img.format());
 
-        outImg = outImg.insert(block, coords.first * x_sectionsInTask, coords.second * y_sectionsInTask);
+            outImg = outImg.insert(block, coords.first * x_sectionsInTask, coords.second * y_sectionsInTask);
+        }
+    }
+    catch( vips::VError& e )
+    {
+        std::cout << "Error occured while preparing resulting image" << std::endl;
+        std::cerr << e.what() << std::endl;
+        return -1;
     }
 
-    std::cout << "Saving resulting image" << std::endl;
+    try
+    {
+        std::cout << "Saving resulting image" << std::endl;
 
-    //! Save the image
-    outImg.pngsave( (char*) arguments.out.c_str() );
+        //! Save the image
+        outImg.pngsave( (char*) arguments.out.c_str() );
+    }
+    catch( vips::VError& e )
+    {
+        std::cout << "Error occured while saving resulting image to " << arguments.out.c_str() << std::endl;
+        std::cerr << e.what() << std::endl;
+        return -1;
+    }
+
+    return 0;
+}
+
+int main(int argc, char** argv)
+{
+    //! Initialize VIPS library
+    if( VIPS_INIT( argv[0] ) )
+    {
+        return -1;
+    }
+
+    std::string in;
+    std::string out;
+    bool help = false;
+
+    Arguments arguments = ProcessArgs(argc, argv);
+
+    if (!arguments.IsValid())
+    {
+        PrintUsage(arguments);
+
+        return help ? 0 : -1;
+    }
+
+    int retVal = Process(arguments);
 
     //! Deinitialize
     vips_shutdown();
 
-    //! Report elapsed time
-    Reporter::ReportElapsedTime();
+    if (0 == retVal)
+    {
+        //! Report elapsed time
+        Reporter::ReportElapsedTime();
+    }
 
-    return 0;
+    return retVal;
 }
