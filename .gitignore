@@ -1,0 +1,8 @@
+# Binaries
+# --------
+*.dll
+*.exe
+
+# Build directories
+# --------
+.obj/

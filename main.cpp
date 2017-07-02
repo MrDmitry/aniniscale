@@ -4,214 +4,187 @@
 * (http://opensource.org/licenses/MIT)
 */
 
-/*
- *  Usage: aniniscale <x_factor> <y_factor> <in_image> <out_image>
- */
-
 #include <vips/vips8>
 
 #include <cstdlib>
-#include <ctime>
-#include <future>
+#include <getopt.h>
 #include <iomanip>
 #include <iostream>
-#include <list>
 #include <map>
 #include <thread>
+#include <vector>
 
-using namespace vips;
+#include "Reporter.hpp"
+#include "WorkerPool.hpp"
 
-static int x_factor = 1;
-static int y_factor = 1;
+static const char* s_appName = "aniniscale";
+static const char* s_versionInfo = "1.0.0";
 
-static int bandCount = 3;
-
-static int taskPixels = 0;
-static int totalPixels = 0;
-
-//! Each task shall be comprised of no more than 64 by 64 sections
-static int taskSectionSide = 64;
-
-static const std::time_t startTime = std::time(0);
-static volatile std::time_t progressReport = std::time(0);
-
-//! Prints out elapsed time at most once per 5 seconds
-void ReportElapsedTime()
+struct Arguments
 {
-    std::time_t elapsed = std::time(0) - startTime;
+    // Required
+    std::string in;
+    std::string out;
 
-    char buffer[9];
-    if (std::strftime(buffer, sizeof(buffer), "%H:%M:%S", std::gmtime(&elapsed)))
+    // Optional
+    int x_blockSize = 8;
+    int y_blockSize = 8;
+    int taskBlockSide = 64;
+    int reportingTimeout = 5;
+    bool help = false;
+
+    //! Returns the validity of argument set
+    bool IsValid() const
     {
-        std::cout << "/" << std::setfill('-') << std::setw(25) << "\\" << std::endl;
-        std::cout << "| Time elapsed: " << buffer << " |" << std::endl;
-        std::cout << "\\" << std::setfill('-') << std::setw(25) << "/" << std::endl;
+        // arguments are valid only if:
+        return !in.empty() && !out.empty() &&   // both in and out are set
+            !help &&                            // -h/--help is not set
+            x_blockSize >= 1 && y_blockSize >= 1;       // x and y block sizes are positive integers
     }
-    else
-    {
-        std::cout << "Failed to convert data ¯\\_(ツ)_/¯" << std::endl;
-    }
-}
-
-//! Prints out ETA at most once per 5 seconds
-void EstimateTimeLeft(uint32_t tasksLeft)
-{
-    std::time_t elapsed = std::time(0) - startTime;
-
-    uint32_t pixelsLeft = tasksLeft * taskPixels;
-
-    double perSecond = ((double)(totalPixels - pixelsLeft)) / ((double)elapsed);
-
-    std::time_t eta = static_cast<uint32_t>(((double)pixelsLeft) / perSecond);
-
-    char buffer[9];
-    if (std::strftime(buffer, sizeof(buffer), "%H:%M:%S", std::gmtime(&eta)))
-    {
-        std::cout << "/" << std::setfill('-') << std::setw(16) << "\\" << std::endl;
-        std::cout << "| ETA: " << buffer << " |" << std::endl;
-        std::cout << "\\" << std::setfill('-') << std::setw(16) << "/" << std::endl;
-    }
-    else
-    {
-        std::cout << "Failed to convert data ¯\\_(ツ)_/¯" << std::endl;
-    }
-}
-
-void ProgressReport(uint32_t tasksLeft)
-{
-    if (std::time(0) - progressReport < 5)
-    {
-        return;
-    }
-
-    std::cout << std::endl;
-
-    ReportElapsedTime();
-    EstimateTimeLeft(tasksLeft);
-
-    progressReport = std::time(0);
-
-    std::cout << "Tasks left: " << tasksLeft << " (" << tasksLeft * taskPixels << "px)" << std::endl;
-}
-
-//! Described pool of thread workers
-class WorkerPool
-{
-public:
-    typedef std::function<void()> Task;
-
-    //! Worker's routine
-    void Worker()
-    {
-        std::unique_lock<std::mutex> lock(m_mutex);
-
-        std::cout << "Worker ready " << std::this_thread::get_id() << std::endl;
-
-        while (!m_tasks.empty())
-        {
-            //! Before you start working - report current time status
-            ProgressReport(m_tasks.size());
-
-            //! Take a task
-            Task task = m_tasks.front();
-            m_tasks.pop_front();
-
-            //! Let other workers take tasks as well
-            lock.unlock();
-
-            //! Complete your task
-            task();
-
-            //! Rinse and repeat
-            lock.lock();
-        }
-
-        std::cout << "Worker done " << std::this_thread::get_id() << std::endl;
-    }
-
-    //! Pushes task to queue (not thread safe, shall be done before workers are initialized)
-    void PushTask(Task task)
-    {
-        m_tasks.push_back(task);
-    }
-
-private:
-    std::mutex m_mutex;
-
-    std::list<Task> m_tasks;
 };
 
-//! Task at hand - process portion of an image
-void work(VImage img, std::vector<uint8_t>& out)
+void PrintUsage(const Arguments& arguments)
 {
-    //! Get image dimensions
-    const uint32_t width = img.width();
-    const uint32_t height = img.height();
-
-    //! Calculate tile count (== pixels in the end result)
-    const uint32_t x_tiles = width / x_factor;
-    const uint32_t y_tiles = height / y_factor;
-
-    //! Calculate size of each tile
-    const uint32_t size = x_factor * y_factor;
-
-    //! Calculate color threshold - if color has this much, it is dominating
-    const uint32_t win = size / 2;
-
-    //! Get pixel data
-    const uint8_t* imgPixels = reinterpret_cast<const uint8_t*>(img.data());
-
-    //! Iterate over all tiles
-    for (uint32_t x = 0; x < x_tiles; ++x)
+    if (!arguments.help && !arguments.IsValid())
     {
-        for (uint32_t y = 0; y < y_tiles; ++y)
+        if (arguments.in.empty())
         {
-            //! Find dominant color
-            // @TODO: there must be some better way to do this. Histograms?
-            std::map<uint32_t, uint32_t> colors;
-            const uint8_t* dominant = 0;
-            uint32_t domCount = 0;
+            std::cout << "Input image path is required!" << std::endl;
+        }
 
-            //! Iterate over all pixels in original area
-            for (int areaX = 0; areaX < x_factor; ++areaX)
+        if (arguments.out.empty())
+        {
+            std::cout << "Output image path is required!" << std::endl;
+        }
+
+        if (arguments.x_blockSize < 1)
+        {
+            std::cout << "-x/--x-block must be a positive integer" << std::endl;
+        }
+
+        if (arguments.y_blockSize < 1)
+        {
+            std::cout << "-y/--y-block must be a positive integer" << std::endl;
+        }
+
+        std::cout << std::endl;
+    }
+
+    if (arguments.help)
+    {
+        std::cout << s_appName << " v" << s_versionInfo << std::endl;
+        std::cout << "Downscales image by reducing blocks in original image to a single pixel of dominant color." << std::endl;
+        std::cout << std::endl;
+
+        std::cout << "Divides given image into multiple task areas. The size of each area is determined by a number of factors:" << std::endl;
+        std::cout << "  - initial image size;" << std::endl;
+        std::cout << "  - number of processing threads;" << std::endl;
+        std::cout << "  - block size;" << std::endl;
+        std::cout << "  - number of blocks inside each task." << std::endl;
+        std::cout << std::endl;
+        std::cout << "Each task consists of the following steps:" << std::endl;
+        std::cout << "  1. Pick a block of pixels" << std::endl;
+        std::cout << "  2. Find dominant color in this block" << std::endl;
+        std::cout << "  3. Write dominant color to resulting image" << std::endl;
+        std::cout << "After all tasks are complete, resulting image is saved as png" << std::endl;
+        std::cout << std::endl;
+    }
+
+    std::cout << "Usage:" << std::endl;
+    std::cout << s_appName << " [options] -i/--input INPUT -o/--output OUTPUT" << std::endl;
+    std::cout << std::endl;
+
+    const uint32_t requiredWidth = 32;
+    std::cout << "Required arguments:" << std::endl;
+    std::cout << "  " << std::left << std::setw(requiredWidth) << "-i INPUT, --input=INPUT" << "path to input image" << std::endl;
+    std::cout << "  " << std::left << std::setw(requiredWidth) << "-o OUTPUT, --output=OUTPUT" << "path to output image" << std::endl;
+    std::cout << std::endl;
+
+    Arguments defaultArgs;
+
+    const uint32_t optionalWidth = 32;
+    std::cout << "Optional arguments:" << std::endl;
+    std::cout << "  " << std::left << std::setw(optionalWidth) << "-h, --help" << "prints detailed help message" << std::endl;
+    std::cout << "  " << std::left << std::setw(optionalWidth) << "-x NUM, --x-block=NUM" << "block size on X axis [default " << defaultArgs.x_blockSize << "]" << std::endl;
+    std::cout << "  " << std::left << std::setw(optionalWidth) << "-y NUM, --y-block=NUM" << "block size on Y axis [default " <<  defaultArgs.y_blockSize << "]" << std::endl;
+    std::cout << "  " << std::left << std::setw(optionalWidth) << "-t NUM, --task-block-side=NUM" << "maximum number of blocks in any processing task [default " << defaultArgs.taskBlockSide << "]" << std::endl;
+    std::cout << "  " << std::left << std::setw(optionalWidth) << "-r NUM, --reporting-timeout=NUM" << "minimum timeout between log reports in seconds [default " << defaultArgs.reportingTimeout << "]" << std::endl;
+}
+
+Arguments ProcessArgs(int argc, char** argv)
+{
+    static struct option options[] = {
+        {"x-block", required_argument, 0, 'x'},
+        {"y-block", required_argument, 0, 'y'},
+
+        {"input", required_argument, 0, 'i'},
+        {"output", required_argument, 0, 'o'},
+
+        {"task-block-side", required_argument, 0, 't'},
+
+        {"reporting-timeout", required_argument, 0, 'r'},
+
+        {"help", no_argument, 0, 'h'},
+
+        {0, 0, 0, 0}
+    };
+
+    Arguments arguments;
+
+    while (true)
+    {
+        int c = getopt_long(argc, argv, "x:y:i:o:t:r:h", options, 0);
+
+        if (c == -1)
+        {
+            break;
+        }
+
+        switch (c)
+        {
+            case 'x': // x-block
             {
-                for (int areaY = 0; areaY < y_factor; ++areaY)
-                {
-                    const uint8_t* pixel = imgPixels + (
-                        (areaY + y * y_factor) * width + areaX + x * x_factor
-                        ) * bandCount;
-
-                    uint32_t color = 0;
-
-                    //! Get color value
-                    for (int b = 0; b < bandCount; ++b)
-                    {
-                        color |= pixel[b] << ((bandCount - 1 - b) * 8);
-                    }
-
-                    //! Increase the number of votes for that color and check if it's dominating
-                    colors[color] += 1;
-
-                    if (domCount < colors[color])
-                    {
-                        domCount = colors[color];
-                        dominant = pixel;
-
-                        if (domCount >= win)
-                        {
-                            break;
-                        }
-                    }
-                }
+                arguments.x_blockSize = atoi(optarg);
+                break;
             }
-
-            //! Paint the resulting pixel with dominant color
-            for (int b = 0; b < bandCount; ++b)
+            case 'y': // y-block
             {
-                out[(y * x_tiles + x) * bandCount + b] = *(dominant + b);
+                arguments.y_blockSize = atoi(optarg);
+                break;
+            }
+            case 'i': // input
+            {
+                arguments.in = std::string(optarg);
+                break;
+            }
+            case 'o': // output
+            {
+                arguments.out = std::string(optarg);
+                break;
+            }
+            case 't': // task-block-side
+            {
+                arguments.taskBlockSide = atoi(optarg);
+                break;
+            }
+            case 'r': // reporting-timeout
+            {
+                arguments.reportingTimeout = atoi(optarg);
+                break;
+            }
+            case 'h': // help
+            {
+                arguments.help = true;
+                break;
+            }
+            default:
+            {
+                break;
             }
         }
     }
+
+    return arguments;
 }
 
 int main(int argc, char** argv)
@@ -222,48 +195,38 @@ int main(int argc, char** argv)
         return -1;
     }
 
-    //! Check if we have enough arguments
-    // @TODO: Argument correctness check? If arguments are messed up it may behave unexpectedly
-    if (argc < 5)
-    {
-        std::cout << "Not enough arguments" << std::endl;
-        std::cout << "Usage: aniniscale <x_factor> <y_factor> <in_image> <out_image> [<task_side>]" << std::endl;
-        return -1;
-    }
+    std::string in;
+    std::string out;
+    bool help = false;
 
-    //! Get factors
-    x_factor = atoi(argv[1]);
-    y_factor = atoi(argv[2]);
+    Arguments arguments = ProcessArgs(argc, argv);
 
-    //! If any factor is < 1 we're not going to do a thing
-    if (x_factor < 1 || y_factor < 1)
+    if (!arguments.IsValid())
     {
-        return -1;
-    }
+        PrintUsage(arguments);
 
-    if (argc > 5)
-    {
-        taskSectionSide = atoi(argv[5]);
+        return help ? 0 : -1;
     }
 
     //! Open the image and check channel count
-    VImage img = VImage::new_from_file( argv[3] );
-    bandCount = img.bands();
+    vips::VImage img = vips::VImage::new_from_file( arguments.in.c_str() );
+    int bandCount = img.bands();
 
-    //! If both factors are 1, we can just save the image
-    if (x_factor == 1 && y_factor == 1)
+    //! If both blocks are 1, we can just save the image
+    if (arguments.x_blockSize == 1 && arguments.y_blockSize == 1)
     {
-        img.pngsave(argv[4]);
+        img.pngsave( (char*) arguments.out.c_str() );
         return 0;
     }
 
     //! Get image information and estimate how it will be divided
     const uint32_t width = img.width();
     const uint32_t height = img.height();
-    const uint32_t x_tiles = width / x_factor;
-    const uint32_t y_tiles = height / y_factor;
 
-    totalPixels = width * height;
+    const uint32_t x_tiles = width / arguments.x_blockSize;
+    const uint32_t y_tiles = height / arguments.y_blockSize;
+
+    uint32_t totalPixels = width * height;
 
     //! Check how many threads we can run
     uint32_t workerCount = std::thread::hardware_concurrency();
@@ -287,41 +250,42 @@ int main(int argc, char** argv)
     }
 
     //! Tasks shall not be too big, so we keep them manageable
-    int x_section = x_tiles / workerCount;
+    int x_sectionsInTask = x_tiles / workerCount;
 
-    while (x_section > taskSectionSide)
+    while (x_sectionsInTask > arguments.taskBlockSide)
     {
-        x_section /= 2;
+        x_sectionsInTask /= 2;
     }
 
-    int y_section = y_tiles / workerCount;
+    int y_sectionsInTask = y_tiles / workerCount;
 
-    while (y_section > taskSectionSide)
+    while (y_sectionsInTask > arguments.taskBlockSide)
     {
-        y_section /= 2;
+        y_sectionsInTask /= 2;
     }
 
-    const uint32_t x_sectionSize = x_section * x_factor;
-    const uint32_t y_sectionSize = y_section * y_factor;
+    const uint32_t x_taskSize = x_sectionsInTask * arguments.x_blockSize;
+    const uint32_t y_taskSize = y_sectionsInTask * arguments.y_blockSize;
 
-    const uint32_t x_sectionCount = width / x_sectionSize;
-    const uint32_t y_sectionCount = height / y_sectionSize;
+    const uint32_t x_taskCount = width / x_taskSize;
+    const uint32_t y_taskCount = height / y_taskSize;
 
     //! Store total number of pixels on the image for the reporting
-    taskPixels = x_sectionSize * y_sectionSize;
+    Reporter::s_taskPixels = x_taskSize * y_taskSize;
+    Reporter::s_tasksTotal = x_taskCount * y_taskCount;
 
-    WorkerPool pool;
+    WorkerPool pool(bandCount, arguments.x_blockSize, arguments.y_blockSize);
 
-    std::cout << "Creating " << x_sectionCount * y_sectionCount << " tasks of size " << x_sectionSize << "x" << y_sectionSize << std::endl;
+    std::cout << "Creating " << x_taskCount * y_taskCount << " tasks of size " << x_taskSize << "x" << y_taskSize << std::endl;
 
     std::map<std::pair<uint32_t, uint32_t>, std::vector<uint8_t>> result;
 
     //! Allocate all needed memory
-    for (uint32_t x_task = 0; x_task < x_sectionCount; ++x_task)
+    for (uint32_t x_task = 0; x_task < x_taskCount; ++x_task)
     {
-        for (uint32_t y_task = 0; y_task < y_sectionCount; ++y_task)
+        for (uint32_t y_task = 0; y_task < y_taskCount; ++y_task)
         {
-            result[std::pair<uint32_t, uint32_t>(x_task, y_task)].resize(x_section * y_section * bandCount);
+            result[std::pair<uint32_t, uint32_t>(x_task, y_task)].resize(x_sectionsInTask * y_sectionsInTask * bandCount);
         }
     }
 
@@ -337,20 +301,20 @@ int main(int argc, char** argv)
     };
 
     //! Create tasks to process each section
-    for (uint32_t x_task = 0; x_task < x_sectionCount; ++x_task)
+    for (uint32_t x_task = 0; x_task < x_taskCount; ++x_task)
     {
-        for (uint32_t y_task = 0; y_task < y_sectionCount; ++y_task)
+        for (uint32_t y_task = 0; y_task < y_taskCount; ++y_task)
         {
             std::pair<uint32_t, uint32_t> coords(x_task, y_task);
 
-            VImage area = img.extract_area(coords.first * x_sectionSize,
-                coords.second * y_sectionSize,
-                x_sectionSize,
-                y_sectionSize);
+            vips::VImage area = img.extract_area(coords.first * x_taskSize,
+                coords.second * y_taskSize,
+                x_taskSize,
+                y_taskSize);
 
-            pool.PushTask([=, &result](){ work(area, result[std::pair<uint32_t, uint32_t>(x_task, y_task)]); });
+            pool.PushTask([=, &result](WorkerPool& worker){ worker.ProcessImage(area, result[std::pair<uint32_t, uint32_t>(x_task, y_task)]); });
 
-            ReportTaskCreationProgress(x_task * y_sectionCount + y_task);
+            ReportTaskCreationProgress(x_task * y_taskCount + y_task);
         }
     }
 
@@ -361,6 +325,9 @@ int main(int argc, char** argv)
     //! Spawn workers
     std::vector<std::thread> workers;
     workers.resize(workerCount);
+
+    std::cout << "Initializing " << workerCount << " workers" << std::endl;
+
     for (uint32_t i = 0; i < workerCount; ++i)
     {
         workers[i] = std::thread(&WorkerPool::Worker, &pool);
@@ -374,11 +341,13 @@ int main(int argc, char** argv)
 
     workers.clear();
 
+    std::cout << "Processing complete, preparing resulting image" << std::endl;
+
     //! Prepare the buffer to store final output
     std::vector<uint8_t> outBuffer;
     outBuffer.resize(x_tiles * y_tiles * bandCount);
 
-    VImage out = VImage::new_from_memory(outBuffer.data(), outBuffer.size(),
+    vips::VImage outImg = vips::VImage::new_from_memory(outBuffer.data(), outBuffer.size(),
         x_tiles, y_tiles, bandCount, img.format());
 
     //! Go through worker results and place them in resulting image
@@ -386,20 +355,22 @@ int main(int argc, char** argv)
     {
         const std::pair<uint32_t, uint32_t>& coords = r.first;
         std::vector<uint8_t>& buffer = r.second;
-        VImage block = VImage::new_from_memory(buffer.data(), buffer.size(),
-            x_section, y_section, bandCount, img.format());
+        vips::VImage block = vips::VImage::new_from_memory(buffer.data(), buffer.size(),
+            x_sectionsInTask, y_sectionsInTask, bandCount, img.format());
 
-        out = out.insert(block, coords.first * x_section, coords.second * y_section);
+        outImg = outImg.insert(block, coords.first * x_sectionsInTask, coords.second * y_sectionsInTask);
     }
 
+    std::cout << "Saving resulting image" << std::endl;
+
     //! Save the image
-    out.pngsave(argv[4]);
+    outImg.pngsave( (char*) arguments.out.c_str() );
 
     //! Deinitialize
     vips_shutdown();
 
     //! Report elapsed time
-    ReportElapsedTime();
+    Reporter::ReportElapsedTime();
 
     return 0;
 }
